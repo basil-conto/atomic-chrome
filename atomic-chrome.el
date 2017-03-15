@@ -71,27 +71,34 @@
   :group 'atomic-chrome)
 
 (defcustom atomic-chrome-enable-auto-update t
-  "If non-nil, edit on Emacs is reflected to Chrome instantly, \
-otherwise you need to type \"C-xC-s\" manually."
+  "Whether to update Chrome text in real time.
+If non-nil, edit in Emacs is instantly reflected in Chrome;
+otherwise \\[atomic-chrome-send-buffer-text] needs to be typed
+manually."
   :type 'boolean
   :group 'atomic-chrome)
 
 (defcustom atomic-chrome-enable-bidirectional-edit t
-  "If non-nil, you can edit both on Chrome text area and Emacs, \
-otherwise edit on Chrome is ignored while editing on Emacs."
+  "Whether to enable editing in both Chrome and Emacs.
+If non-nil, editing is possible both in Emacs and the Chrome text
+area; otherwise editing in Chrome is ignored while editing in
+Emacs."
   :type 'boolean
   :group 'atomic-chrome)
 
-(defcustom atomic-chrome-default-major-mode 'text-mode
+(defcustom atomic-chrome-default-major-mode #'text-mode
   "Default major mode for editing buffer."
   :type 'function
   :group 'atomic-chrome)
 
-(defcustom atomic-chrome-url-major-mode-alist nil
-  "Association list of URL regexp and corresponding major mode \
-which is used to select major mode for specified website."
-  :type '(alist :key-type (regexp :tag "regexp")
-                :value-type (function :tag "major mode"))
+(defcustom atomic-chrome-url-major-mode-alist ()
+  "Alist of per-website major modes for editing buffer.
+Each element should have the form (REGEXP . FUNCTION). Opening an
+editing buffer for a website whose URL matches REGEXP specifies
+FUNCTION as the mode function to use. When FUNCTION is nil,
+`atomic-chrome-default-major-mode' is called instead."
+  :type '(alist :key-type (regexp :tag "Regular expression")
+                :value-type (function :tag "Major mode"))
   :group 'atomic-chrome)
 
 (defcustom atomic-chrome-edit-mode-hook nil
@@ -104,6 +111,11 @@ which is used to select major mode for specified website."
   :type 'hook
   :group 'atomic-chrome)
 
+(defcustom atomic-chrome-process-name "atomic-chrome-httpd"
+  ""
+  :type 'string
+  :group 'atomic-chrome)
+
 (defvar atomic-chrome-server-atomic-chrome nil
   "Websocket server connection handle for Atomic Chrome.")
 
@@ -114,15 +126,22 @@ which is used to select major mode for specified website."
   "Hash table of editing buffer and its assciated data.
 Each element has a list consisting of (websocket, frame).")
 
-(defun atomic-chrome-get-websocket (buffer)
-  "Lookup websocket associated with buffer BUFFER \
-from `atomic-chrome-buffer-table'."
-  (nth 0 (gethash buffer atomic-chrome-buffer-table)))
+(defun atomic-chrome--get (&optional buffer)
+  "Lookup BUFFER in `atomic-chrome-buffer-table'.
+BUFFER defaults to the current buffer."
+  (gethash (or buffer (current-buffer)) atomic-chrome-buffer-table))
 
-(defun atomic-chrome-get-frame (buffer)
-  "Lookup frame associated with buffer BUFFER \
-from `atomic-chrome-buffer-table'."
-  (nth 1 (gethash buffer atomic-chrome-buffer-table)))
+(defun atomic-chrome-get-websocket (&optional buffer)
+  "Return websocket associated with BUFFER.
+BUFFER defaults to the current buffer and is looked up in
+`atomic-chrome-buffer-table'."
+  (nth 0 (atomic-chrome--get buffer)))
+
+(defun atomic-chrome-get-frame (&optional buffer)
+  "Return frame associated with BUFFER.
+BUFFER defaults to the current buffer and is looked up in
+`atomic-chrome-buffer-table'."
+  (nth 1 (atomic-chrome--get buffer)))
 
 (defun atomic-chrome-get-buffer-by-socket (socket)
   "Lookup buffer which is associated to the websocket SOCKET \
@@ -143,6 +162,18 @@ from `atomic-chrome-buffer-table'."
 (defun atomic-chrome-send-buffer-text ()
   "Send request to update text with current buffer content."
   (interactive)
+  ;; (let ((socket (atomic-chrome-get-websocket (current-buffer))))
+  ;;   (when socket
+  ;;     (let* ((text    (buffer-substring-no-properties (point-min) (point-max)))
+  ;;            (payload (if (eq (websocket-server-conn socket)
+  ;;     (let* ((payload `(("text" . ,(buffer-substring-no-properties
+  ;;                                   (point-min) (point-max)))))
+  ;;            (text    (if (eq (websocket-server-conn socket)
+  ;;                             atomic-chrome-server-ghost-text)
+  ;;                         payload
+  ;;                       `(("type"    . "updateText")
+  ;;                         ("payload" . ,text)))
+  ;;       (websocket-send-text socket (json-encode text))))))))
   (let ((socket (atomic-chrome-get-websocket (current-buffer)))
         (text (buffer-substring-no-properties (point-min) (point-max))))
     (when (and socket text)
@@ -161,7 +192,7 @@ The specified major mode is used if URL matches to one of the alist,
 otherwise fallback to `atomic-chrome-default-major-mode'"
   (funcall (or (and url (assoc-default url
                                        atomic-chrome-url-major-mode-alist
-                                       'string-match))
+                                       #'string-match-p))
                atomic-chrome-default-major-mode)))
 
 (defun atomic-chrome-show-edit-buffer (buffer title)
@@ -247,8 +278,8 @@ where FRAME show raw data received."
 
 (defvar atomic-chrome-edit-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-x C-s") 'atomic-chrome-send-buffer-text)
-    (define-key map (kbd "C-c C-c") 'atomic-chrome-close-current-buffer)
+    (define-key map (kbd "C-x C-s") #'atomic-chrome-send-buffer-text)
+    (define-key map (kbd "C-c C-c") #'atomic-chrome-close-current-buffer)
     map)
   "Keymap for minor mode `atomic-chrome-edit-mode'.")
 
@@ -284,7 +315,7 @@ where FRAME show raw data received."
   "Start the HTTP server for Ghost Text query."
   (interactive)
   (make-network-process
-   :name "atomic-chrome-httpd"
+   :name atomic-chrome-process-name
    :family 'ipv4
    :host 'local
    :service 4001
@@ -293,17 +324,13 @@ where FRAME show raw data received."
    :server t
    :noquery t))
 
-(defun atomic-chrome-normalize-header (header)
-  "Destructively capitalize the components of HEADER."
-  (mapconcat #'capitalize (split-string header "-") "-"))
-
 (defun atomic-chrome-httpd-parse-string (string)
   "Parse client http header STRING into alist."
   (let* ((lines (split-string string "[\n\r]+"))
          (req (list (split-string (car lines))))
          (post (cadr (split-string string "\r\n\r\n"))))
     (dolist (line (butlast (cdr lines)))
-      (push (list (atomic-chrome-normalize-header (car (split-string line ": ")))
+      (push (list (capitalize (car (split-string line ": ")))
                   (mapconcat #'identity
                              (cdr (split-string line ": ")) ": "))
             req))
@@ -342,23 +369,25 @@ STRING is the string process received."
        (memq 'atomic-chrome atomic-chrome-extension-type-list)
        (setq atomic-chrome-server-atomic-chrome
              (atomic-chrome-start-websocket-server 64292)))
-  (and (not (process-status "atomic-chrome-httpd"))
+  (and (not (process-status atomic-chrome-process-name))
        (memq 'ghost-text atomic-chrome-extension-type-list)
        (atomic-chrome-start-httpd))
   (global-atomic-chrome-edit-mode 1))
 
 ;;;###autoload
-(defun atomic-chrome-stop-server nil
+(defun atomic-chrome-stop-server ()
   "Stop websocket server for atomic-chrome."
   (interactive)
-  (when atomic-chrome-server-atomic-chrome
-    (websocket-server-close atomic-chrome-server-atomic-chrome)
-    (setq atomic-chrome-server-atomic-chrome nil))
-  (when atomic-chrome-server-ghost-text
-    (websocket-server-close atomic-chrome-server-ghost-text)
-    (setq atomic-chrome-server-ghost-text nil))
-  (when (process-status "atomic-chrome-httpd")
-    (delete-process "atomic-chrome-httpd"))
+  (dolist (server-var '(atomic-chrome-server-atomic-chrome
+                        atomic-chrome-server-ghost-text))
+    (let ((server (symbol-value server-var)))
+      (when server
+        (websocket-server-close server)
+        (set server-var nil))))
+
+  (when (process-status atomic-chrome-process-name)
+    (delete-process atomic-chrome-process-name))
+
   (global-atomic-chrome-edit-mode 0))
 
 (provide 'atomic-chrome)
